@@ -10,8 +10,7 @@ try {
     $ValidResolvers = @('Google', 'CloudFlare', 'Quad9')
     if ($ValidResolvers -contains $Config.Resolver) {
         $Resolver = $Config.Resolver
-    }
-    else {
+    } else {
         $Resolver = 'Google'
         $Config = @{
             PartitionKey = 'Domains'
@@ -20,8 +19,7 @@ try {
         }
         Add-CIPPAzDataTableEntity @ConfigTable -Entity $Config -Force
     }
-}
-catch {
+} catch {
     $Resolver = 'Google'
 }
 Set-DnsResolver -Resolver $Resolver
@@ -30,8 +28,7 @@ $Domain = $DomainObject.rowKey
 
 try {
     $Tenant = $DomainObject.TenantDetails | ConvertFrom-Json -ErrorAction Stop
-}
-catch {
+} catch {
     $Tenant = @{Tenant = 'None' }
 }
 
@@ -39,12 +36,15 @@ catch {
 
 $Result = [PSCustomObject]@{
     Tenant               = $Tenant.Tenant
+    TenantID             = $Tenant.TenantGUID
     GUID                 = $($Domain.Replace('.', ''))
     LastRefresh          = $(Get-Date (Get-Date).ToUniversalTime() -UFormat '+%Y-%m-%dT%H:%M:%S.000Z')
     Domain               = $Domain
+    NSRecords            = (Read-NSRecord -Domain $Domain).Records
     ExpectedSPFRecord    = ''
     ActualSPFRecord      = ''
     SPFPassAll           = ''
+    ActualMXRecords      = ''
     MXPassTest           = ''
     DMARCPresent         = ''
     DMARCFullPolicy      = ''
@@ -54,6 +54,7 @@ $Result = [PSCustomObject]@{
     DNSSECPresent        = ''
     MailProvider         = ''
     DKIMEnabled          = ''
+    DKIMRecords          = ''
     Score                = ''
     MaximumScore         = 160
     ScorePercentage      = ''
@@ -82,6 +83,7 @@ $MXRecord = Read-MXRecord -Domain $Domain -ErrorAction Stop
 
 $Result.ExpectedSPFRecord = $MXRecord.ExpectedInclude
 $Result.MXPassTest = $false
+$Result.ActualMXRecords = $MXRecord.Records
 
 # Check fail counts to ensure all tests pass
 #$MXWarnCount = $MXRecord.ValidationWarns | Measure-Object | Select-Object -ExpandProperty Count
@@ -90,15 +92,13 @@ $MXFailCount = $MXRecord.ValidationFails | Measure-Object | Select-Object -Expan
 if ($MXFailCount -eq 0) {
     $Result.MXPassTest = $true
     $ScoreDomain += $Scores.MXRecommended
-}
-else {
+} else {
     $ScoreExplanation.Add('MX record did not pass validation') | Out-Null
 }
 
 if ([string]::IsNullOrEmpty($MXRecord.MailProvider)) {
     $Result.MailProvider = 'Unknown'
-}
-else {
+} else {
     $Result.MailProvider = $MXRecord.MailProvider.Name
 }
 
@@ -109,22 +109,19 @@ try {
         $Result.ActualSPFRecord = $SPFRecord.Record
         if ($SPFRecord.RecordCount -eq 1) {
             $ScoreDomain += $Scores.SPFPresent
-        }
-        else {
+        } else {
             $ScoreExplanation.Add('Multiple SPF records detected') | Out-Null
         }
-    }
-    else {
+    } else {
         $Result.ActualSPFRecord = 'No SPF Record'
         $ScoreExplanation.Add('No SPF Record Found') | Out-Null
     }
-}
-catch {
-    $Message = 'SPF Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
-    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+} catch {
+    $Message = 'SPF Error'
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -LogData (Get-CippException -Exception $_) -sev Error
     throw $Message
 }
-    
+
 # Check SPF Record
 $Result.SPFPassAll = $false
 
@@ -135,8 +132,7 @@ $SPFFailCount = $SPFRecord.ValidationFails | Measure-Object | Select-Object -Exp
 if ($SPFFailCount -eq 0) {
     $ScoreDomain += $Scores.SPFCorrectAll
     $Result.SPFPassAll = $true
-}
-else {
+} else {
     $ScoreExplanation.Add('SPF record did not pass validation') | Out-Null
 }
 
@@ -147,19 +143,18 @@ try {
     If ([string]::IsNullOrEmpty($DMARCPolicy.Record)) {
         $Result.DMARCPresent = $false
         $ScoreExplanation.Add('No DMARC Records Found') | Out-Null
-    }
-    else {
+    } else {
         $Result.DMARCPresent = $true
         $ScoreDomain += $Scores.DMARCPresent
 
-        $Result.DMARCFullPolicy = $DMARCResults.Record
-        if ($DMARCPolicy.Policy -eq 'reject' -and $DMARCPolicy.SubdomainPolicy -eq 'reject') { 
+        $Result.DMARCFullPolicy = $DMARCPolicy.Record
+        if ($DMARCPolicy.Policy -eq 'reject' -and $DMARCPolicy.SubdomainPolicy -eq 'reject') {
             $Result.DMARCActionPolicy = 'Reject'
             $ScoreDomain += $Scores.DMARCSetReject
         }
-        if ($DMARCPolicy.Policy -eq 'none') { 
+        if ($DMARCPolicy.Policy -eq 'none') {
             $Result.DMARCActionPolicy = 'None'
-            $ScoreExplanation.Add('DMARC is not being enforced') | Out-Null 
+            $ScoreExplanation.Add('DMARC is not being enforced') | Out-Null
         }
         if ($DMARCPolicy.Policy -eq 'quarantine') {
             $Result.DMARCActionPolicy = 'Quarantine'
@@ -171,8 +166,7 @@ try {
         if ($ReportEmailCount -gt 0) {
             $Result.DMARCReportingActive = $true
             $ScoreDomain += $Scores.DMARCReportingActive
-        }
-        else {
+        } else {
             $Result.DMARCReportingActive = $False
             $ScoreExplanation.Add('DMARC Reporting not Configured') | Out-Null
         }
@@ -180,16 +174,14 @@ try {
         if ($DMARCPolicy.Percent -eq 100) {
             $Result.DMARCPercentagePass = $true
             $ScoreDomain += $Scores.DMARCPercentageGood
-        }
-        else {
+        } else {
             $Result.DMARCPercentagePass = $false
-            $ScoreExplanation.Add('DMARC Not Checking All Messages') | Out-Null                
+            $ScoreExplanation.Add('DMARC Not Checking All Messages') | Out-Null
         }
     }
-}
-catch {
-    $Message = 'DMARC Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
-    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+} catch {
+    $Message = 'DMARC Error'
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -LogData (Get-CippException -Exception $_) -sev Error
     throw $Message
 }
 
@@ -201,44 +193,42 @@ try {
     if (($DNSSECFailCount + $DNSSECWarnCount) -eq 0) {
         $Result.DNSSECPresent = $true
         $ScoreDomain += $Scores.DNSSECPresent
-    }
-    else {
+    } else {
         $Result.DNSSECPresent = $false
-        $ScoreExplanation.Add('DNSSEC Not Configured or Enabled') | Out-Null 
+        $ScoreExplanation.Add('DNSSEC Not Configured or Enabled') | Out-Null
     }
-}
-catch {
-    $Message = 'DNSSEC Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
-    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+} catch {
+    $Message = 'DNSSEC Error'
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -LogData (Get-CippException -Exception $_) -sev Error
     throw $Message
 }
 
 # DKIM Check
 try {
     $DkimParams = @{
-        Domain = $Domain
+        Domain                       = $Domain
+        FallbackToMicrosoftSelectors = $true
     }
     if (![string]::IsNullOrEmpty($DomainObject.DkimSelectors)) {
         $DkimParams.Selectors = $DomainObject.DkimSelectors | ConvertFrom-Json
     }
 
     $DkimRecord = Read-DkimRecord @DkimParams -ErrorAction Stop
-    
+
     $DkimRecordCount = $DkimRecord.Records | Measure-Object | Select-Object -ExpandProperty Count
     $DkimFailCount = $DkimRecord.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
     #$DkimWarnCount = $DkimRecord.ValidationWarns | Measure-Object | Select-Object -ExpandProperty Count
     if ($DkimRecordCount -gt 0 -and $DkimFailCount -eq 0) {
         $Result.DKIMEnabled = $true
         $ScoreDomain += $Scores.DKIMActiveAndWorking
-    }
-    else {
+        $Result.DKIMRecords = $DkimRecord.Records | Select-Object Selector, Record
+    } else {
         $Result.DKIMEnabled = $false
-        $ScoreExplanation.Add('DKIM Not Configured') | Out-Null 
+        $ScoreExplanation.Add('DKIM Not Configured') | Out-Null
     }
-}
-catch {
-    $Message = 'DKIM Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
-    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+} catch {
+    $Message = 'DKIM Exception'
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -LogData (Get-CippException -Exception $_) -sev Error
     throw $Message
 }
 # Final Score
